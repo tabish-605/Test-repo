@@ -1,0 +1,47 @@
+version: '3.9'
+services:
+  frontend:
+    build: ./frontend
+    ports: ["80:80"]
+    environment:
+      - OTEL_SERVICE_NAME=frontend
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
+    depends_on: [backend, collector]
+
+  backend:
+    build: ./backend
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db/ecomm
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317
+      - AWS_REGION=us-east-1
+    ports: ["8000:8000"]
+    depends_on: [db, collector]
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_USER=user
+      - POSTGRES_DB=ecomm
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+
+  collector:
+    image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+    volumes:
+      - ./collector/adot-config.yaml:/etc/collector.yaml
+    command: ["--config=/etc/collector.yaml"]
+    environment:
+      - AWS_REGION=us-east-1
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  loadgen:
+    build: ./loadgen
+    depends_on: [frontend]
+
+volumes:
+  pgdata:
