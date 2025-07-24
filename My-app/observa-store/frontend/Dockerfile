@@ -3,20 +3,23 @@
 # Stage 1: Build the React application
 FROM node:18-alpine AS build
  
-# Set the working directory inside the container
 WORKDIR /app
  
-# Copy package.json and package-lock.json to leverage Docker's caching mechanism
 COPY package*.json ./
  
-# Install project dependencies
 RUN npm install
  
-# Copy the rest of the application's source code, including the 'public' and 'src' folders
+# Copy the rest of the application's source code
 COPY . .
  
+# --- START DEBUGGING ---
+# The following lines will print the file structure inside the container.
+# This helps verify that your files, especially public/index.html, are copied correctly.
+RUN echo "--- Listing contents of /app directory: ---" && ls -la /app
+RUN echo "--- Listing contents of /app/public directory: ---" && ls -la /app/public
+# --- END DEBUGGING ---
+ 
 # Build the application for production
-# The build script will now be able to find /app/public/index.html
 RUN npm run build
  
 # Stage 2: Set up the production environment with Nginx
