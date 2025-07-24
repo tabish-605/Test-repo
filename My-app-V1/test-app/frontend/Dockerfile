@@ -3,6 +3,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
+RUN npm install --save-dev typescript @types/node @types/react
 COPY . .
 RUN npm run build
 
