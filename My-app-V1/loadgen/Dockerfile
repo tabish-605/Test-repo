@@ -1,5 +1,6 @@
 FROM python:3.11-alpine
 # 1. Install transient build deps
+WORKDIR /code
 RUN apk add --no-cache \
       build-base \        # pulls in gcc, musl-dev, make, etc.
       linux-headers \
