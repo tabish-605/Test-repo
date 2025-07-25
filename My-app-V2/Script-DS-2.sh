@@ -1384,3 +1384,51 @@ const SearchBar = () => {
 
 export default SearchBar;
 EOL
+
+cat > ecommerce-otel/frontend/next.config.js <<'EOL'
+/** @type {import('next').NextConfig} */
+module.exports = {
+  reactStrictMode: true,
+  images: {
+    domains: ['via.placeholder.com'],
+  },
+  experimental: {
+    instrumentationHook: true,
+  },
+  output: 'standalone', // ADD THIS LINE
+}
+EOL
+
+
+cat > ecommerce-otel/frontend/Dockerfile <<'EOL'
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV production
+ENV NEXT_TELEMETRY_DISABLED 1
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+ENV PORT 3000
+
+CMD ["node", "server.js"]
+EOL
