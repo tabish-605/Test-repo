@@ -1115,3 +1115,272 @@ This project demonstrates a modern e-commerce application with full-stack observ
 
 ```bash
 docker-compose up --build
+
+EOL
+
+cat > ecommerce-otel/frontend/components/cart/CartDrawer.js <<'EOL'
+import { useCart } from '../../lib/cart';
+import CartItem from './CartItem';
+
+const CartDrawer = () => {
+  const { cart, isCartOpen, setIsCartOpen, cartCount, cartTotal, removeItem, updateQuantity } = useCart();
+
+  if (!isCartOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50">
+      <div 
+        className="absolute inset-0 bg-black bg-opacity-50"
+        onClick={() => setIsCartOpen(false)}
+      />
+      
+      <div className="absolute right-0 top-0 h-full w-full max-w-md bg-white shadow-xl flex flex-col">
+        <div className="p-6 border-b">
+          <div className="flex justify-between items-center">
+            <h2 className="text-xl font-bold">Your Cart ({cartCount})</h2>
+            <button onClick={() => setIsCartOpen(false)} className="text-gray-500 hover:text-gray-700">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        
+        <div className="flex-grow overflow-y-auto p-6">
+          {cartCount === 0 ? (
+            <div className="text-center py-12">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mx-auto text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+              </svg>
+              <p className="mt-4 text-gray-600">Your cart is empty</p>
+              <button 
+                onClick={() => setIsCartOpen(false)}
+                className="mt-6 bg-indigo-600 text-white px-6 py-2 rounded-md hover:bg-indigo-700"
+              >
+                Continue Shopping
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-6">
+                {cart.map(item => (
+                  <CartItem 
+                    key={`${item.id}-${item.size}`} 
+                    item={item} 
+                    onRemove={() => removeItem(item.id, item.size)}
+                    onUpdateQuantity={(qty) => updateQuantity(item.id, item.size, qty)}
+                  />
+                ))}
+              </div>
+              
+              <div className="mt-8 border-t pt-6">
+                <div className="flex justify-between text-lg font-semibold mb-4">
+                  <span>Subtotal:</span>
+                  <span>${cartTotal.toFixed(2)}</span>
+                </div>
+                <p className="text-gray-600 text-sm mb-6">
+                  Shipping and taxes calculated at checkout.
+                </p>
+                <button 
+                  onClick={() => router.push('/checkout')}
+                  className="w-full bg-indigo-600 text-white py-3 rounded-md hover:bg-indigo-700"
+                >
+                  Proceed to Checkout
+                </button>
+                <button 
+                  onClick={() => setIsCartOpen(false)}
+                  className="w-full mt-3 border border-gray-300 text-gray-700 py-3 rounded-md hover:bg-gray-50"
+                >
+                  Continue Shopping
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default CartDrawer;
+EOL
+
+cat > ecommerce-otel/frontend/components/cart/CartItem.js <<'EOL'
+const CartItem = ({ item, onRemove, onUpdateQuantity }) => {
+  return (
+    <div className="flex items-center gap-4">
+      <div className="w-24 h-24 bg-gray-100 rounded-md overflow-hidden">
+        {item.image ? (
+          <img 
+            src={item.image} 
+            alt={item.name} 
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <div className="w-full h-full bg-gray-200 border-2 border-dashed rounded-xl flex items-center justify-center text-gray-400">
+            No Image
+          </div>
+        )}
+      </div>
+      
+      <div className="flex-grow">
+        <h3 className="font-medium">{item.name}</h3>
+        {item.size && <p className="text-gray-600 text-sm">Size: {item.size}</p>}
+        <p className="font-semibold">${item.price.toFixed(2)}</p>
+        
+        <div className="flex items-center mt-2">
+          <div className="flex border rounded-md">
+            <button 
+              onClick={() => onUpdateQuantity(item.quantity - 1)}
+              className="px-3 py-1 bg-gray-100 hover:bg-gray-200"
+            >
+              -
+            </button>
+            <span className="px-3 py-1">{item.quantity}</span>
+            <button 
+              onClick={() => onUpdateQuantity(item.quantity + 1)}
+              className="px-3 py-1 bg-gray-100 hover:bg-gray-200"
+            >
+              +
+            </button>
+          </div>
+          <button 
+            onClick={onRemove}
+            className="ml-4 text-red-600 hover:text-red-800 text-sm"
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default CartItem;
+EOL
+
+cat > ecommerce-otel/frontend/components/search/FilterPanel.js <<'EOL'
+const FilterPanel = ({ filters, setFilters }) => {
+  const categories = ['electronics', 'clothing', 'home', 'accessories'];
+  
+  return (
+    <div className="bg-white p-6 rounded-lg shadow-sm">
+      <h3 className="text-lg font-semibold mb-4">Filters</h3>
+      
+      <div className="space-y-6">
+        <div>
+          <h4 className="font-medium mb-2">Category</h4>
+          <div className="space-y-2">
+            <label className="flex items-center">
+              <input
+                type="radio"
+                name="category"
+                checked={filters.category === 'all'}
+                onChange={() => setFilters({...filters, category: 'all'})}
+                className="mr-2"
+              />
+              <span>All Categories</span>
+            </label>
+            
+            {categories.map(category => (
+              <label key={category} className="flex items-center">
+                <input
+                  type="radio"
+                  name="category"
+                  checked={filters.category === category}
+                  onChange={() => setFilters({...filters, category})}
+                  className="mr-2"
+                />
+                <span className="capitalize">{category}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        
+        <div>
+          <h4 className="font-medium mb-2">Price Range</h4>
+          <div className="space-y-3">
+            <div>
+              <input
+                type="range"
+                min="0"
+                max="1000"
+                value={filters.priceRange[1]}
+                onChange={(e) => setFilters({
+                  ...filters,
+                  priceRange: [filters.priceRange[0], parseInt(e.target.value)]
+                })}
+                className="w-full"
+              />
+            </div>
+            <div className="flex justify-between text-sm">
+              <span>$0</span>
+              <span>${filters.priceRange[1]}</span>
+            </div>
+          </div>
+        </div>
+        
+        <div>
+          <h4 className="font-medium mb-2">Minimum Rating</h4>
+          <div className="space-y-2">
+            {[4, 3, 2, 1, 0].map(rating => (
+              <label key={rating} className="flex items-center">
+                <input
+                  type="radio"
+                  name="rating"
+                  checked={filters.minRating === rating}
+                  onChange={() => setFilters({...filters, minRating: rating})}
+                  className="mr-2"
+                />
+                <span>{rating}+ Stars</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default FilterPanel;
+EOL
+
+
+cat > ecommerce-otel/frontend/components/search/SearchBar.js <<'EOL'
+import { useState } from 'react';
+import { useRouter } from 'next/router';
+
+const SearchBar = () => {
+  const [query, setQuery] = useState('');
+  const router = useRouter();
+
+  const handleSearch = (e) => {
+    e.preventDefault();
+    if (query.trim()) {
+      router.push(`/products?search=${encodeURIComponent(query.trim())}`);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSearch} className="relative">
+      <input
+        type="text"
+        placeholder="Search products..."
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+      />
+      <button 
+        type="submit"
+        className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-500 hover:text-indigo-600"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+        </svg>
+      </button>
+    </form>
+  );
+};
+
+export default SearchBar;
+EOL
