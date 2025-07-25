@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------
+# ecommerce-otel-boostrap.sh
+# One-shot scaffolding script that generates a full-stack
+# e-commerce demo:
+#   • Next 13 + Tailwind 3 front-end (ShopNext)
+#   • FastAPI back-end (placeholder)
+#   • Postgres, Jaeger, Prometheus, Grafana, OTEL collector
+#   • Docker-Compose orchestration
+# The script assumes a *nix shell with coreutils.  Run from an
+# empty directory:  bash ecommerce-otel-bootstrap.sh
+# ------------------------------------------------------------
+
+set -e
+
+# ---------- 1. Directory structure ----------
+mkdir -p ecommerce-otel/{frontend/{components/{layout,product,ui},lib,pages/{products,account},public/images,styles},backend,collector,prometheus,grafana/provisioning/datasources}
+touch ecommerce-otel/{.env.example,.gitignore}
+
+# ---------- 2. Docker-Compose ----------
+cat > ecommerce-otel/docker-compose.yml <<'YML'
+version: '3.8'
+
+services:
+  frontend:
+    build: ./frontend
+    ports: [ "3000:3000" ]
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on: [ backend, otel-collector ]
+
+  backend:
+    image: tiangolo/uvicorn-gunicorn-fastapi:python3.11
+    volumes: [ ./backend:/app ]
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/ecommerce
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    ports: [ "8000:8000" ]
+    depends_on: [ postgres, otel-collector ]
+
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    volumes: [ postgres-data:/var/lib/postgresql/data ]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.60.0
+    command: [ "--config=/etc/otel-collector-config.yaml" ]
+    volumes: [ ./collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml ]
+    ports:
+      - "4317:4317"
+      - "8889:8889"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    ports: [ "16686:16686" ]
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes: [ ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml ]
+    ports: [ "9090:9090" ]
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    volumes: [ ./grafana/provisioning:/etc/grafana/provisioning ]
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    ports: [ "3001:3000" ]
+
+volumes:
+  postgres-data:
+YML
+
+# ---------- 3. OpenTelemetry Collector ----------
+cat > ecommerce-otel/collector/otel-collector-config.yaml <<'YML'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+exporters:
+  jaeger:
+    endpoint: "jaeger:14250"
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: ecommerce
+  logging:
+
+processors:
+  batch:
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger,logging]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus,logging]
+YML
+
+# ---------- 4. Prometheus ----------
+cat > ecommerce-otel/prometheus/prometheus.yml <<'YML'
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'otel-collector'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['otel-collector:8889']
+YML
+
+# ---------- 5. Grafana datasource ----------
+cat > ecommerce-otel/grafana/provisioning/datasources/datasource.yml <<'YML'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+YML
+
+# ---------- 6. Front-end package.json ----------
+cat > ecommerce-otel/frontend/package.json <<'NPM'
+{
+  "name": "shopnext",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.49.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.49.1",
+    "@opentelemetry/sdk-node": "^0.49.1",
+    "next": "14.2.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-feather": "^2.0.10"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.17",
+    "postcss": "^8.4.33",
+    "tailwindcss": "^3.4.4"
+  }
+}
+NPM
+
+# ---------- 7. Next config ----------
+cat > ecommerce-otel/frontend/next.config.js <<'JS'
+/** @type {import('next').NextConfig} */
+module.exports = {
+  reactStrictMode: true,
+  images: { domains: ['via.placeholder.com'] },
+  experimental: { instrumentationHook: true }
+};
+JS
+
+# ---------- 8. Tailwind config ----------
+cat > ecommerce-otel/frontend/tailwind.config.js <<'JS'
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./pages/**/*.{js,ts,jsx,tsx}",
+    "./components/**/*.{js,ts,jsx,tsx}",
+    "./app/**/*.{js,ts,jsx,tsx}"
+  ],
+  theme: {
+    extend: {
+      colors: {
+        primary: {
+          50:  "#eef2ff",
+          100: "#e0e7ff",
+          600: "#4f46e5",
+          700: "#4338ca"
+        }
+      }
+    }
+  },
+  plugins: []
+};
+JS
+
+# ---------- 9. Global CSS ----------
+cat > ecommerce-otel/frontend/styles/globals.css <<'CSS'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,body {
+  padding: 0;
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
+}
+CSS
+
+# ---------- 10. Tracing bootstrap ----------
+cat > ecommerce-otel/frontend/lib/tracing.js <<'JS'
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+
+const sdk = new NodeSDK({
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT + '/v1/traces'
+  }),
+  serviceName: 'shopnext-frontend',
+  instrumentations: [getNodeAutoInstrumentations()]
+});
+sdk.start();
+JS
+
+# ---------- 11. API helpers ----------
+cat > ecommerce-otel/frontend/lib/api.js <<'JS'
+export const fetchProducts = async () => {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/products`);
+  return res.json();
+};
+JS
+
+# ---------- 12. Cart context (placeholder) ----------
+cat > ecommerce-otel/frontend/lib/cart.js <<'JS'
+import { createContext, useContext, useEffect, useState } from 'react';
+
+const CartContext = createContext(null);
+export const useCart = () => useContext(CartContext);
+
+export function CartProvider({ children }) {
+  const [cart, setCart] = useState([]);
+
+  useEffect(() => {
+    const saved = localStorage.getItem('cart');
+    if (saved) setCart(JSON.parse(saved));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('cart', JSON.stringify(cart));
+  }, [cart]);
+
+  const addToCart = (p) => setCart(c => [...c, { ...p, quantity: 1 }]);
+
+  return (
+    <CartContext.Provider value={{ cart, addToCart }}>
+      {children}
+    </CartContext.Provider>
+  );
+}
+JS
+
+# ---------- 13. _app.js with global styles + layout ----------
+cat > ecommerce-otel/frontend/pages/_app.js <<'JSX'
+import '../styles/globals.css';
+import Layout from '../components/layout/Layout';
+import { CartProvider } from '../lib/cart';
+
+export default function MyApp({ Component, pageProps }) {
+  return (
+    <CartProvider>
+      <Layout>
+        <Component {...pageProps} />
+      </Layout>
+    </CartProvider>
+  );
+}
+JSX
+
+# ---------- 14. Layout component ----------
+cat > ecommerce-otel/frontend/components/layout/Layout.js <<'JSX'
+import Link from 'next/link';
+import { ShoppingCart } from 'react-feather';
+import { useCart } from '../../lib/cart';
+
+export default function Layout({ children }) {
+  const { cart } = useCart();
+  const count = cart.reduce((t, i) => t + i.quantity, 0);
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <header className="bg-white border-b sticky top-0 z-50 shadow-sm">
+        <nav className="max-w-7xl mx-auto px-4 md:px-8 py-3 flex items-center justify-between">
+          <Link href="/" className="text-xl font-bold text-primary-700">ShopNext</Link>
+          <ul className="hidden md:flex gap-6 text-sm text-gray-700">
+            <li><Link href="/products">All Products</Link></li>
+            <li><Link href="/products?c=electronics">Electronics</Link></li>
+            <li><Link href="/products?c=clothing">Clothing</Link></li>
+            <li><Link href="/products?c=home-garden">Home&nbsp;&amp;&nbsp;Garden</Link></li>
+          </ul>
+          <Link href="/cart" className="relative">
+            <ShoppingCart className="w-6 h-6" />
+            {count > 0 && (
+              <span className="absolute -top-1 -right-2 bg-primary-600 text-white rounded-full text-xs w-5 h-5 flex items-center justify-center">
+                {count}
+              </span>
+            )}
+          </Link>
+        </nav>
+      </header>
+
+      <main className="flex-grow">{children}</main>
+
+      <footer className="bg-gray-50 mt-20">
+        <div className="max-w-7xl mx-auto px-4 py-10 grid sm:grid-cols-2 md:grid-cols-4 gap-8 text-sm">
+          <div>
+            <h3 className="font-semibold mb-2">Shop</h3>
+            <ul className="space-y-1 text-gray-600">
+              <li><Link href="/products">All Products</Link></li>
+              <li><Link href="/products?c=electronics">Electronics</Link></li>
+              <li><Link href="/products?c=clothing">Clothing</Link></li>
+            </ul>
+          </div>
+          <div>
+            <h3 className="font-semibold mb-2">Customer Service</h3>
+            <ul className="space-y-1 text-gray-600">
+              <li><Link href="/contact">Contact Us</Link></li>
+              <li><Link href="/faq">FAQs</Link></li>
+              <li><Link href="/shipping">Shipping Policy</Link></li>
+            </ul>
+          </div>
+        </div>
+        <p className="text-center text-xs text-gray-500 py-4">&copy; {new Date().getFullYear()} ShopNext Inc.</p>
+      </footer>
+    </div>
+  );
+}
+JSX
+
+# ---------- 15. Hero component ----------
+cat > ecommerce-otel/frontend/components/ui/Hero.js <<'JSX'
+import Link from 'next/link';
+
+export default function Hero() {
+  return (
+    <section className="relative bg-[url('/images/hero.jpg')] bg-center bg-cover h-[60vh] flex items-center">
+      <div className="absolute inset-0 bg-black/40" />
+      <div className="relative z-10 max-w-3xl mx-auto text-center text-white px-4">
+        <h1 className="text-4xl sm:text-6xl font-bold tracking-tight">Discover our newest arrivals</h1>
+        <p className="mt-4 text-lg">Quality products at prices you’ll love.</p>
+        <Link href="/products" className="inline-block mt-6 px-6 py-3 bg-primary-600 hover:bg-primary-700 rounded-md text-sm font-medium shadow">
+          Shop&nbsp;Now
+        </Link>
+      </div>
+    </section>
+  );
+}
+JSX
+
+# ---------- 16. Product Card ----------
+cat > ecommerce-otel/frontend/components/product/ProductCard.js <<'JSX'
+import { useCart } from '../../lib/cart';
+
+export default function ProductCard({ product }) {
+  const { addToCart } = useCart();
+
+  return (
+    <div className="group border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition">
+      <img src={product.image} alt={product.name} className="h-56 w-full object-cover group-hover:scale-105 transition" />
+      <div className="p-4">
+        <h3 className="text-sm font-medium text-gray-900 truncate">{product.name}</h3>
+        <p className="mt-1 text-sm text-gray-500">{product.category}</p>
+        <p className="mt-2 font-semibold">${product.price.toFixed(2)}</p>
+        <button
+          onClick={() => addToCart(product)}
+          className="mt-3 w-full inline-flex justify-center items-center gap-2 bg-primary-600 text-white text-sm py-2 rounded hover:bg-primary-700"
+        >
+          Add&nbsp;to&nbsp;Cart
+        </button>
+      </div>
+    </div>
+  );
+}
+JSX
+
+# ---------- 17. Home page ----------
+cat > ecommerce-otel/frontend/pages/index.js <<'JSX'
+import Hero from '../components/ui/Hero';
+import ProductCard from '../components/product/ProductCard';
+import { fetchProducts } from '../lib/api';
+
+export default function Home({ products }) {
+  return (
+    <>
+      <Hero />
+      <section className="max-w-7xl mx-auto px-4 py-12">
+        <h2 className="text-2xl font-semibold mb-6">Featured products</h2>
+        <div className="grid gap-6 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+          {products.map(p => <ProductCard key={p.id} product={p} />)}
+        </div>
+      </section>
+    </>
+  );
+}
+
+export async function getStaticProps() {
+  const products = await fetchProducts();
+  return { props: { products }, revalidate: 60 };
+}
+JSX
+
+# ---------- 18. Sample hero image ----------
+curl -sL https://picsum.photos/1280/720?random=1 -o ecommerce-otel/frontend/public/images/hero.jpg
+
+# ---------- 19. Placeholder back-end (FastAPI health probe) ----------
+cat > ecommerce-otel/backend/main.py <<'PY'
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/api/products")
+def products():
+    return [
+        {"id": 1, "name": "Wireless Headphones", "category": "Electronics", "price": 79.99,
+         "image": "https://via.placeholder.com/400x400.png?text=Headphones"},
+        {"id": 2, "name": "Organic Cotton T-Shirt", "category": "Clothing", "price": 19.99,
+         "image": "https://via.placeholder.com/400x400.png?text=T+Shirt"},
+        {"id": 3, "name": "Ceramic Plant Pot", "category": "Home & Garden", "price": 24.49,
+         "image": "https://via.placeholder.com/400x400.png?text=Plant+Pot"}
+    ]
+PY
+
+# ---------- 20. .gitignore ----------
+cat > ecommerce-otel/.gitignore <<'GIT'
+/node_modules
+/.next
+.env
+__pycache__/
+postgres-data/
+GIT
+
+echo "✅  Project scaffolded in ecommerce-otel/"
+echo "👉  cd ecommerce-otel && docker compose up --build"
