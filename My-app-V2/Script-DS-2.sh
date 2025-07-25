@@ -845,10 +845,10 @@ sqlalchemy==2.0.20
 psycopg2-binary==2.9.7
 python-dotenv==1.0.0
 opentelemetry-api==1.19.0
-opentelemetry-sdk==1.19.0
+opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http==1.19.0
-opentelemetry-instrumentation-fastapi==0.41b0
-opentelemetry-instrumentation-sqlalchemy==0.41b0
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-sqlalchemy
 EOL
 
 # Create main backend file
