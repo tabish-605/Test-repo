@@ -1,0 +1,903 @@
+#!/bin/bash
+
+# This script creates the complete directory structure and files for the
+# otel-ecommerce-demo project.
+
+echo "Creating project directories..."
+mkdir -p otel-ecommerce-demo/backend/app
+mkdir -p otel-ecommerce-demo/frontend/app/components
+mkdir -p otel-ecommerce-demo/frontend/app/lib
+mkdir -p otel-ecommerce-demo/frontend/app/cart
+mkdir -p otel-ecommerce-demo/frontend/app/products/[id]
+mkdir -p otel-ecommerce-demo/observability/grafana/provisioning/dashboards
+mkdir -p otel-ecommerce-demo/observability/grafana/provisioning/datasources
+mkdir -p otel-ecommerce-demo/observability/prometheus
+mkdir -p otel-ecommerce-demo/db
+
+cd otel-ecommerce-demo
+
+# --- Create docker-compose.yml ---
+echo "Creating docker-compose.yml..."
+cat << 'EOF' > docker-compose.yml
+version: '3.8'
+
+services:
+  # Frontend Service (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces
+    depends_on:
+      - backend
+      - otel-collector
+    networks:
+      - ecom-network
+
+  # Backend Service (FastAPI)
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres-db:5432/ecomdb
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=backend-fastapi
+    depends_on:
+      - postgres-db
+      - otel-collector
+    networks:
+      - ecom-network
+
+  # Database Service (PostgreSQL)
+  postgres-db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=ecomdb
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - ecom-network
+
+  # Observability Stack
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # gRPC
+      - "4318:4318" # HTTP
+      - "8889:8889" # Prometheus metrics
+    depends_on:
+      - jaeger
+      - prometheus
+    networks:
+      - ecom-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # Jaeger UI
+    networks:
+      - ecom-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - ecom-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000" # Grafana UI exposed on 3001 to avoid conflict with frontend
+    volumes:
+      - ./observability/grafana/provisioning/:/etc/grafana/provisioning/
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    networks:
+      - ecom-network
+
+networks:
+  ecom-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+EOF
+
+# --- Backend Files ---
+echo "Creating backend files..."
+cat << 'EOF' > backend/requirements.txt
+fastapi
+uvicorn[standard]
+psycopg2-binary
+SQLAlchemy
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-sqlalchemy
+opentelemetry-instrumentation-psycopg2
+opentelemetry-exporter-otlp
+EOF
+
+cat << 'EOF' > backend/Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /code
+
+COPY ./requirements.txt /code/requirements.txt
+
+RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+
+COPY ./app /code/app
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+cat << 'EOF' > backend/app/telemetry.py
+import logging
+import os
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+
+def setup_telemetry(app):
+    """Configures OpenTelemetry for the FastAPI application."""
+
+    service_name = os.environ.get("OTEL_SERVICE_NAME", "backend-fastapi")
+    otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+
+    resource = Resource(attributes={"service.name": service_name})
+
+    # Tracing setup
+    tracer_provider = TracerProvider(resource=resource)
+    trace_exporter = OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces")
+    tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+    trace.set_tracer_provider(tracer_provider)
+    
+    # Database instrumentation
+    SQLAlchemyInstrumentor().instrument()
+
+    # Metrics setup
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=f"{otlp_endpoint}/v1/metrics")
+    )
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(meter_provider)
+
+    # Instrument FastAPI
+    FastAPIInstrumentor.instrument_app(app, tracer_provider=tracer_provider)
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    return logger, trace.get_tracer(__name__), metrics.get_meter(__name__)
+EOF
+
+cat << 'EOF' > backend/app/database.py
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/ecomdb")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+EOF
+
+cat << 'EOF' > backend/app/models.py
+from sqlalchemy import Column, Integer, String, Float
+from .database import Base
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    description = Column(String)
+    price = Column(Float)
+    image_url = Column(String)
+EOF
+
+cat << 'EOF' > backend/app/schemas.py
+from pydantic import BaseModel
+
+class ProductBase(BaseModel):
+    name: str
+    description: str
+    price: float
+    image_url: str
+
+class Product(ProductBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+EOF
+
+cat << 'EOF' > backend/app/crud.py
+from sqlalchemy.orm import Session
+from . import models, schemas
+
+def get_product(db: Session, product_id: int):
+    return db.query(models.Product).filter(models.Product.id == product_id).first()
+
+def get_products(db: Session, skip: int = 0, limit: int = 100):
+    return db.query(models.Product).offset(skip).limit(limit).all()
+EOF
+
+cat << 'EOF' > backend/app/main.py
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from typing import List
+
+from . import crud, models, schemas, telemetry
+from .database import SessionLocal, engine, get_db
+
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+
+logger, tracer, meter = telemetry.setup_telemetry(app)
+
+http_requests_total = meter.create_counter(
+    "http_requests_total",
+    description="Total number of HTTP requests",
+    unit="1",
+)
+products_viewed_counter = meter.create_counter(
+    "products_viewed_total", description="Total number of products viewed"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/products", response_model=List[schemas.Product])
+def read_products(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    http_requests_total.add(1, {"endpoint": "/api/products"})
+    logger.info("Fetching product list")
+    products = crud.get_products(db, skip=skip, limit=limit)
+    return products
+
+@app.get("/api/products/{product_id}", response_model=schemas.Product)
+def read_product(product_id: int, db: Session = Depends(get_db)):
+    with tracer.start_as_current_span("read_product_endpoint") as span:
+        span.set_attribute("product_id", product_id)
+        http_requests_total.add(1, {"endpoint": f"/api/products/{product_id}"})
+        
+        logger.info(f"Fetching product with id {product_id}", extra={"product_id": product_id})
+        
+        db_product = crud.get_product(db, product_id=product_id)
+        if db_product is None:
+            logger.warning(f"Product with id {product_id} not found")
+            raise HTTPException(status_code=404, detail="Product not found")
+        
+        products_viewed_counter.add(1, {"product_name": db_product.name})
+        span.add_event("Product found", {"product_name": db_product.name})
+        
+        return db_product
+EOF
+
+cat << 'EOF' > backend/app/__init__.py
+# This file can be empty
+EOF
+
+
+# --- Database Files ---
+echo "Creating database init script..."
+cat << 'EOF' > db/init.sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price REAL NOT NULL,
+    image_url VARCHAR(255)
+);
+
+INSERT INTO products (name, description, price, image_url) VALUES
+('Cooling Fan', 'A fan to keep your processor cool and quiet.', 25.50, 'https://i.imgur.com/gfg6058.jpeg'),
+('Gaming Mouse', 'High precision gaming mouse with customizable RGB.', 49.99, 'https://i.imgur.com/kH5A43I.jpeg'),
+('Mechanical Keyboard', 'Clicky and satisfying mechanical keyboard for typing and gaming.', 89.90, 'https://i.imgur.com/a89A82A.jpeg'),
+('4K Monitor', 'Stunning 27-inch 4K monitor with HDR support.', 349.00, 'https://i.imgur.com/Yv62G9p.jpeg'),
+('Webcam', '1080p HD webcam for clear video calls.', 59.95, 'https://i.imgur.com/M8A8057.jpeg'),
+('Graphics Card', 'Latest generation graphics card for ultimate gaming performance.', 799.99, 'https://i.imgur.com/Q2y1jY6.jpeg'),
+('Headset', 'Noise-cancelling headset with a clear microphone.', 120.00, 'https://i.imgur.com/A6p2d8g.jpeg'),
+('SSD Drive', '1TB NVMe SSD for lightning-fast load times.', 110.50, 'https://i.imgur.com/9P3T7zD.jpeg');
+EOF
+
+# --- Frontend Files ---
+echo "Creating frontend files..."
+cat << 'EOF' > frontend/package.json
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/auto-instrumentations-web": "^0.38.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.51.0",
+    "@opentelemetry/instrumentation": "^0.51.0",
+    "@opentelemetry/resources": "^1.24.0",
+    "@opentelemetry/sdk-trace-web": "^1.24.0",
+    "@opentelemetry/semantic-conventions": "^1.24.0",
+    "next": "14.2.3",
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.3",
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5"
+  }
+}
+EOF
+
+cat << 'EOF' > frontend/tsconfig.json
+{
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+EOF
+
+cat << 'EOF' > frontend/next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+    images: {
+        remotePatterns: [
+            {
+                protocol: 'https',
+                hostname: 'i.imgur.com',
+            },
+        ],
+    },
+    experimental: {
+        instrumentationHook: true,
+    },
+};
+
+export default nextConfig;
+EOF
+
+cat << 'EOF' > frontend/Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+EOF
+
+# Note: You will need to manually run 'npm install -D tailwindcss postcss autoprefixer' and 'npx tailwindcss init -p'
+# for the globals.css to work correctly. We will add a placeholder for now.
+cat << 'EOF' > frontend/tailwind.config.ts
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {
+      backgroundImage: {
+        "gradient-radial": "radial-gradient(var(--tw-gradient-stops))",
+        "gradient-conic":
+          "conic-gradient(from 180deg at 50% 50%, var(--tw-gradient-stops))",
+      },
+    },
+  },
+  plugins: [],
+};
+export default config;
+EOF
+
+cat << 'EOF' > frontend/postcss.config.js
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+EOF
+
+cat << 'EOF' > frontend/instrumentation.ts
+export async function register() {
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    // Server-side instrumentation (if needed)
+  }
+ 
+  if (process.env.NEXT_RUNTIME === 'edge') {
+     // Edge-side instrumentation (if needed)
+  }
+}
+EOF
+
+cat << 'EOF' > frontend/app/lib/telemetry.ts
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { getWebAutoInstrumentations } from '@opentelemetry/auto-instrumentations-web';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { registerInstrumentations } from '@opentelemetry/instrumentation';
+import { Resource } from '@opentelemetry/resources';
+import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
+
+const setupTelemetry = () => {
+    if (typeof window === 'undefined') {
+        return;
+    }
+
+    const resource = new Resource({
+        [SemanticResourceAttributes.SERVICE_NAME]: 'frontend-nextjs',
+    });
+
+    const provider = new WebTracerProvider({ resource });
+
+    const exporter = new OTLPTraceExporter({
+         url: process.env.NEXT_PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || 'http://localhost:4318/v1/traces',
+    });
+    
+    provider.addSpanProcessor(new BatchSpanProcessor(exporter));
+    provider.register();
+
+    registerInstrumentations({
+        instrumentations: [
+            getWebAutoInstrumentations({
+                '@opentelemetry/instrumentation-fetch': {
+                    propagateTraceHeaderCorsUrls: [/.+/g],
+                    clearTimingResources: true,
+                },
+            }),
+        ],
+    });
+};
+
+setupTelemetry();
+EOF
+
+cat << 'EOF' > frontend/app/layout.tsx
+import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import "./globals.css";
+import Navbar from "./components/Navbar";
+import "./lib/telemetry"; // Import to initialize OTel
+
+const inter = Inter({ subsets: ["latin"] });
+
+export const metadata: Metadata = {
+  title: "OTel E-Commerce Demo",
+  description: "A demo app for full-stack observability",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body className={`${inter.className} bg-gray-100`}>
+        <Navbar />
+        <main className="container mx-auto p-4">{children}</main>
+      </body>
+    </html>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/app/globals.css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+EOF
+
+cat << 'EOF' > frontend/app/components/Navbar.tsx
+import Link from 'next/link';
+
+const Navbar = () => {
+    return (
+        <nav className="bg-white shadow-md">
+            <div className="container mx-auto px-4">
+                <div className="flex justify-between items-center py-4">
+                    <Link href="/" className="text-2xl font-bold text-gray-800">
+                        OTel Store
+                    </Link>
+                    <div>
+                        <Link href="/cart" className="text-gray-600 hover:text-gray-800">
+                            Cart
+                        </Link>
+                    </div>
+                </div>
+            </div>
+        </nav>
+    );
+};
+
+export default Navbar;
+EOF
+
+cat << 'EOF' > frontend/app/components/ProductCard.tsx
+import Link from 'next/link';
+import Image from 'next/image';
+
+interface Product {
+    id: number;
+    name: string;
+    price: number;
+    image_url: string;
+}
+
+const ProductCard = ({ product }: { product: Product }) => {
+    return (
+        <Link href={`/products/${product.id}`}>
+            <div className="bg-white rounded-lg shadow-md p-4 hover:shadow-xl transition-shadow">
+                <Image src={product.image_url} alt={product.name} width={300} height={300} className="w-full h-48 object-cover rounded-t-lg" />
+                <div className="pt-4">
+                    <h3 className="text-lg font-semibold text-gray-800">{product.name}</h3>
+                    <p className="text-gray-600 mt-2">${product.price.toFixed(2)}</p>
+                </div>
+            </div>
+        </Link>
+    );
+};
+
+export default ProductCard;
+EOF
+
+cat << 'EOF' > frontend/app/page.tsx
+'use client'
+import { useEffect, useState } from 'react';
+import ProductCard from './components/ProductCard';
+
+interface Product {
+    id: number;
+    name: string;
+    description: string;
+    price: number;
+    image_url: string;
+}
+
+export default function HomePage() {
+    const [products, setProducts] = useState<Product[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        const fetchProducts = async () => {
+            try {
+                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/products`);
+                if (!res.ok) {
+                    throw new Error('Failed to fetch products');
+                }
+                const data = await res.json();
+                setProducts(data);
+            } catch (error) {
+                console.error(error);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        fetchProducts();
+    }, []);
+
+    if (loading) return <p>Loading products...</p>;
+
+    return (
+        <div>
+            <h1 className="text-3xl font-bold mb-6">Our Products</h1>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                {products.map((product) => (
+                    <ProductCard key={product.id} product={product} />
+                ))}
+            </div>
+        </div>
+    );
+}
+EOF
+
+cat << 'EOF' > frontend/app/products/[id]/page.tsx
+'use client'
+import { useEffect, useState } from 'react';
+import { useParams } from 'next/navigation';
+import Image from 'next/image';
+
+interface Product {
+    id: number;
+    name: string;
+    description: string;
+    price: number;
+    image_url: string;
+}
+
+export default function ProductDetailPage() {
+    const params = useParams();
+    const id = params.id;
+    const [product, setProduct] = useState<Product | null>(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        if (!id) return;
+        const fetchProduct = async () => {
+            try {
+                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/products/${id}`);
+                 if (!res.ok) {
+                    throw new Error('Failed to fetch product');
+                }
+                const data = await res.json();
+                setProduct(data);
+            } catch (error) {
+                console.error(error);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        fetchProduct();
+    }, [id]);
+
+    if (loading) return <p>Loading product...</p>;
+    if (!product) return <p>Product not found.</p>;
+
+    return (
+        <div className="bg-white p-8 rounded-lg shadow-lg">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div>
+                    <Image src={product.image_url} alt={product.name} width={500} height={500} className="w-full rounded-lg" />
+                </div>
+                <div>
+                    <h1 className="text-4xl font-bold mb-4">{product.name}</h1>
+                    <p className="text-gray-700 mb-6">{product.description}</p>
+                    <p className="text-3xl font-semibold text-gray-900 mb-6">${product.price.toFixed(2)}</p>
+                    <button className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors">
+                        Add to Cart
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+EOF
+
+cat << 'EOF' > frontend/app/cart/page.tsx
+export default function CartPage() {
+    return (
+        <div>
+            <h1 className="text-3xl font-bold mb-6">Your Shopping Cart</h1>
+            <div className="bg-white p-8 rounded-lg shadow-lg text-center">
+                <p className="text-gray-600">Your cart is currently empty.</p>
+                <p className="text-gray-500 mt-2">(Cart functionality is a TODO for this demo)</p>
+            </div>
+        </div>
+    );
+}
+EOF
+
+
+# --- Observability Files ---
+echo "Creating observability config files..."
+cat << 'EOF' > observability/otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, logging]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus, logging]
+EOF
+
+cat << 'EOF' > observability/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
+EOF
+
+cat << 'EOF' > observability/grafana/provisioning/datasources/datasource.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+EOF
+
+cat << 'EOF' > observability/grafana/provisioning/dashboards/dashboard.yml
+apiVersion: 1
+
+providers:
+- name: 'default'
+  orgId: 1
+  folder: ''
+  type: file
+  disableDeletion: false
+  editable: true
+  options:
+    path: /etc/grafana/provisioning/dashboards
+EOF
+
+cat << 'EOF' > observability/grafana/provisioning/dashboards/default-dashboard.json
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 2,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ],
+      "title": "API Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "9.2.3",
+      "targets": [
+        {
+          "expr": "sum(rate(products_viewed_total[5m]))",
+          "refId": "A"
+        }
+      ],
+      "title": "Products Viewed Per Second",
+      "type": "stat"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 35,
+  "style": "dark",
+  "tags": [],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "E-Commerce Observability",
+  "uid": "ecom-obs",
+  "version": 1
+}
+EOF
+
+echo ""
+echo "Project structure and all files created successfully inside the 'otel-ecommerce-demo' directory."
+echo "Next steps:"
+echo "1. cd otel-ecommerce-demo"
+echo "2. Run 'docker-compose up --build' to start the application."
