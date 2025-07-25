@@ -1,0 +1,863 @@
+#!/usr/bin/env bash
+set -e
+
+echo "🛠  Creating directory structure…"
+mkdir -p \
+  collector \
+  backend/routers \
+  frontend/public \
+  frontend/src/{app/{cart,checkout,thank-you},lib} \
+  frontend/src/components/{product,layout,ui} \
+  grafana/provisioning/{datasources,dashboards} \
+  grafana/dashboards
+
+echo "📝  Writing root files…"
+cat << 'EOF' > README.md
+# OTel-Shop – full-stack observability demo
+
+To run:
+  docker compose up --build
+
+Services
+• frontend  – Next.js 14 + Tailwind + shadcn/ui + React Query + Zustand  
+• backend   – FastAPI + SQLAlchemy + PostgreSQL  
+• collector – OpenTelemetry Collector (OTLP HTTP 4318)  
+• jaeger, prometheus, loki, grafana – observability stack
+EOF
+
+cat << 'EOF' > docker-compose.yml
+version: "3.9"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U shop"]
+      interval: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://shop:shop@db:5432/shop
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+    depends_on: [db, collector]
+    ports: ["8000:8000"]
+
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_OTEL: http://localhost:4318/v1/traces
+    depends_on: [backend, collector]
+    ports: ["3000:3000"]
+
+  collector:
+    build: ./collector
+    ports:
+      - "4318:4318"   # OTLP HTTP
+      - "9464:9464"   # Prometheus scrape
+    depends_on: [jaeger, prometheus, loki]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports: ["16686:16686"]
+
+  prometheus:
+    image: prom/prometheus:v2.52
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+
+  loki:
+    image: grafana/loki:3.0.0
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    ports: ["3001:3000"]
+    depends_on: [prometheus, loki]
+    volumes: ["./grafana/provisioning:/etc/grafana/provisioning"]
+
+volumes:
+  pgdata:
+EOF
+
+cat << 'EOF' > prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["collector:9464"]
+EOF
+
+echo "⚙️  Writing collector…"
+cat << 'EOF' > collector/Dockerfile
+FROM otel/opentelemetry-collector-contrib:0.101.0
+COPY otel-collector-config.yaml /etc/otelcol/config.yaml
+EOF
+
+cat << 'EOF' > collector/otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+
+exporters:
+  jaeger:
+    endpoint: jaeger:14250
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: "0.0.0.0:9464"
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+processors:
+  batch: {}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [loki]
+EOF
+
+echo "🐍  Writing backend…"
+cat << 'EOF' > backend/Dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--reload"]
+EOF
+
+cat << 'EOF' > backend/requirements.txt
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+pydantic==2.7.1
+python-multipart==0.0.9
+opentelemetry-sdk==1.25.0
+opentelemetry-api==1.25.0
+opentelemetry-exporter-otlp==1.25.0
+opentelemetry-instrumentation-fastapi==0.46b0
+opentelemetry-instrumentation-logging==0.46b0
+EOF
+
+cat << 'EOF' > backend/otel.py
+import os, logging
+from opentelemetry import trace, metrics, logs
+from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
+from opentelemetry.sdk.trace import TracerProvider, BatchSpanProcessor
+from opentelemetry.sdk.logs import LoggerProvider, BatchLogRecordProcessor, LoggingHandler
+from opentelemetry.sdk.metrics import MeterProvider, PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+OTEL_EP = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+
+resource = Resource.create({
+    SERVICE_NAME: "backend-api",
+    SERVICE_VERSION: "1.0.0",
+})
+
+# Traces
+tp = TracerProvider(resource=resource)
+tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_EP)))
+trace.set_tracer_provider(tp)
+
+# Metrics
+mp = MeterProvider(
+    resource=resource,
+    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=OTEL_EP))]
+)
+metrics.set_meter_provider(mp)
+
+# Logs
+lp = LoggerProvider(resource=resource)
+lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter(endpoint=OTEL_EP)))
+logs.set_logger_provider(lp)
+logging.basicConfig(level=logging.INFO, handlers=[LoggingHandler(level=logging.INFO, logger_provider=lp)])
+
+def instrument(app):
+    FastAPIInstrumentor.instrument_app(app)
+EOF
+
+cat << 'EOF' > backend/database.py
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False))
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+EOF
+
+cat << 'EOF' > backend/models.py
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, Text, DateTime
+from sqlalchemy.orm import declarative_base, relationship
+from datetime import datetime
+
+Base = declarative_base()
+
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True)
+    slug = Column(String, unique=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text)
+    price = Column(Float, nullable=False)
+    image = Column(String)
+    category = Column(String, index=True)
+    brand = Column(String)
+    inventory = Column(Integer, default=0)
+    active = Column(Boolean, default=True)
+
+class Cart(Base):
+    __tablename__ = "carts"
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    items = relationship("CartItem", back_populates="cart", cascade="all,delete")
+
+class CartItem(Base):
+    __tablename__ = "cart_items"
+    id = Column(Integer, primary_key=True)
+    cart_id = Column(Integer, ForeignKey("carts.id"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Integer, default=1)
+    cart = relationship("Cart", back_populates="items")
+    product = relationship("Product")
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True)
+    cart_id = Column(Integer, ForeignKey("carts.id"))
+    email = Column(String)
+    total = Column(Float)
+    status = Column(String, default="created")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    cart = relationship("Cart")
+EOF
+
+cat << 'EOF' > backend/schemas.py
+from pydantic import BaseModel
+from typing import List, Optional
+
+class ProductIn(BaseModel):
+    name: str
+    slug: str
+    description: Optional[str]
+    price: float
+    image: Optional[str]
+    category: Optional[str]
+    brand: Optional[str]
+    inventory: int = 0
+
+class Product(ProductIn):
+    id: int
+    class Config:
+        from_attributes = True
+
+class CartItemIn(BaseModel):
+    product_id: int
+    quantity: int = 1
+
+class CartItem(CartItemIn):
+    id: int
+    product: Product
+    class Config:
+        from_attributes = True
+
+class Cart(BaseModel):
+    id: int
+    items: List[CartItem] = []
+    class Config:
+        from_attributes = True
+
+class OrderIn(BaseModel):
+    cart_id: int
+    email: str
+
+class Order(BaseModel):
+    id: int
+    total: float
+    status: str
+    cart: Cart
+    class Config:
+        from_attributes = True
+EOF
+
+cat << 'EOF' > backend/crud.py
+from sqlalchemy.orm import Session
+import models, schemas
+
+# Products
+def list_products(db: Session, q: str | None = None, cat: str | None = None):
+    qset = db.query(models.Product).filter(models.Product.active == True)
+    if q:
+        qset = qset.filter(models.Product.name.ilike(f"%{q}%"))
+    if cat:
+        qset = qset.filter(models.Product.category == cat)
+    return qset.all()
+
+def get_product(db: Session, slug: str):
+    return db.query(models.Product).filter(models.Product.slug == slug).first()
+
+# Carts
+def create_cart(db: Session):
+    cart = models.Cart()
+    db.add(cart)
+    db.commit()
+    db.refresh(cart)
+    return cart
+
+def get_cart(db: Session, cart_id: int):
+    return db.query(models.Cart).filter(models.Cart.id == cart_id).first()
+
+def add_item(db: Session, cart_id: int, item: schemas.CartItemIn):
+    cart = get_cart(db, cart_id)
+    line = next((i for i in cart.items if i.product_id == item.product_id), None)
+    if line:
+        line.quantity += item.quantity
+    else:
+        cart.items.append(models.CartItem(**item.model_dump()))
+    db.commit()
+    db.refresh(cart)
+    return cart
+
+# Orders
+def create_order(db: Session, order: schemas.OrderIn):
+    cart = get_cart(db, order.cart_id)
+    total = sum(i.product.price * i.quantity for i in cart.items)
+    o = models.Order(cart_id=order.cart_id, email=order.email, total=total)
+    db.add(o)
+    db.commit()
+    db.refresh(o)
+    return o
+EOF
+
+cat << 'EOF' > backend/routers/product.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+import crud, schemas
+from database import get_db
+
+router = APIRouter(prefix="/products", tags=["products"])
+
+@router.get("/", response_model=list[schemas.Product])
+def list_products(q: str | None = None, cat: str | None = None, db: Session = Depends(get_db)):
+    return crud.list_products(db, q, cat)
+
+@router.get("/{slug}", response_model=schemas.Product)
+def get_product(slug: str, db: Session = Depends(get_db)):
+    prod = crud.get_product(db, slug)
+    if not prod:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return prod
+EOF
+
+cat << 'EOF' > backend/routers/cart.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+import crud, schemas
+from database import get_db
+
+router = APIRouter(prefix="/carts", tags=["carts"])
+
+@router.post("/", response_model=schemas.Cart)
+def new_cart(db: Session = Depends(get_db)):
+    return crud.create_cart(db)
+
+@router.get("/{cart_id}", response_model=schemas.Cart)
+def get_cart(cart_id: int, db: Session = Depends(get_db)):
+    return crud.get_cart(db, cart_id)
+
+@router.post("/{cart_id}/items", response_model=schemas.Cart)
+def add_item(cart_id: int, item: schemas.CartItemIn, db: Session = Depends(get_db)):
+    return crud.add_item(db, cart_id, item)
+EOF
+
+cat << 'EOF' > backend/routers/order.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+import crud, schemas
+from database import get_db
+
+router = APIRouter(prefix="/orders", tags=["orders"])
+
+@router.post("/", response_model=schemas.Order)
+def create_order(order: schemas.OrderIn, db: Session = Depends(get_db)):
+    return crud.create_order(db, order)
+EOF
+
+cat << 'EOF' > backend/main.py
+from fastapi import FastAPI
+from database import engine
+from models import Base
+import otel, routers.product, routers.cart, routers.order
+
+# auto-create tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="OTel-Shop API")
+otel.instrument(app)
+
+for r in (routers.product, routers.cart, routers.order):
+    app.include_router(r.router)
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
+EOF
+
+cat << 'EOF' > backend/seed.sql
+INSERT INTO products (id,slug,name,description,price,image,category,brand,inventory)
+VALUES
+ (1,'classic-tee','Classic Tee','Soft cotton T-shirt',25.00,'https://dummyimage.com/400x400','Apparel','ACME',100),
+ (2,'coffee-mug','Coffee Mug','Ceramic mug 350ml',9.50,'https://dummyimage.com/400x400','Home','ACME',100);
+EOF
+
+echo "🚀  Writing frontend…"
+cat << 'EOF' > frontend/Dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN pnpm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/.next /usr/share/nginx/html/.next
+COPY --from=builder /app/public /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EOF
+
+touch frontend/pnpm-lock.yaml
+
+cat << 'EOF' > frontend/nginx.conf
+server {
+  listen       80;
+  server_name  localhost;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  location /_next/ {
+    alias /usr/share/nginx/html/_next/;
+  }
+
+  location / {
+    try_files \$uri /index.html;
+  }
+}
+EOF
+
+cat << 'EOF' > frontend/package.json
+{
+  "name": "otel-shop",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "@tanstack/react-query": "5.26.0",
+    "zustand": "4.5.2",
+    "lucide-react": "0.364.0",
+    "tailwindcss": "3.4.4",
+    "clsx": "2.1.0",
+    "@opentelemetry/api": "1.6.0",
+    "@opentelemetry/resources": "1.15.0",
+    "@opentelemetry/sdk-trace-web": "1.15.0",
+    "@opentelemetry/exporter-trace-otlp-http": "1.15.0",
+    "@opentelemetry/instrumentation-fetch": "0.46.0",
+    "react-toastify": "9.2.3",
+    "shadcn-ui": "0.8.0"
+  }
+}
+EOF
+
+cat << 'EOF' > frontend/tailwind.config.mjs
+/** @type {import('tailwindcss').Config} */
+export default {
+  darkMode: 'class',
+  content: ["./src/**/*.{ts,tsx,js,jsx}"],
+  theme: { extend: {} },
+  plugins: []
+}
+EOF
+
+cat << 'EOF' > frontend/next.config.mjs
+export default {
+  images: {
+    domains: ['picsum.photos','dummyimage.com']
+  }
+}
+EOF
+
+cat << 'EOF' > frontend/src/lib/otel.ts
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { ZoneContextManager } from '@opentelemetry/context-zone';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { registerInstrumentations } from '@opentelemetry/instrumentation';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
+import { Resource } from '@opentelemetry/resources';
+
+export function initOtel() {
+  const provider = new WebTracerProvider({
+    resource: new Resource({ 'service.name': 'frontend-web' }),
+  });
+
+  provider.addSpanProcessor(
+    new BatchSpanProcessor(
+      new OTLPTraceExporter({
+        url: process.env.NEXT_PUBLIC_OTEL
+      })
+    )
+  );
+
+  provider.register({ contextManager: new ZoneContextManager() });
+
+  registerInstrumentations({
+    instrumentations: [new FetchInstrumentation()],
+  });
+}
+EOF
+
+cat << 'EOF' > frontend/src/lib/api.ts
+import { QueryClient } from '@tanstack/react-query';
+export const queryClient = new QueryClient();
+
+export const API_URL = process.env.NEXT_PUBLIC_API_URL!;
+
+export async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(\`\${API_URL}\${url}\`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers || {})
+    }
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+EOF
+
+cat << 'EOF' > frontend/src/lib/store.ts
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+type Line = { id: number; slug: string; name: string; price: number; qty: number };
+interface CartState {
+  lines: Line[];
+  add:   (l: Line) => void;
+  remove:(id: number) => void;
+  clear: () => void;
+}
+
+export const useCart = create<CartState>()(
+  persist(
+    (set) => ({
+      lines: [],
+      add: (l) => set((s) => {
+        const idx = s.lines.findIndex(x => x.id === l.id);
+        if (idx > -1) s.lines[idx].qty += l.qty;
+        else s.lines.push(l);
+        return {...s};
+      }),
+      remove: (id) => set((s) => ({ lines: s.lines.filter(l => l.id !== id) })),
+      clear: () => set({ lines: [] }),
+    }),
+    { name: "otel-shop-cart" }
+  )
+);
+EOF
+
+cat << 'EOF' > frontend/src/globals.css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+EOF
+
+cat << 'EOF' > frontend/src/app/layout.tsx
+'use client';
+import './globals.css';
+import { ReactNode, useEffect } from 'react';
+import { initOtel } from '@/lib/otel';
+import Navbar from '@/components/layout/Navbar';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { queryClient } from '@/lib/api';
+import Toast from '@/components/ui/Toast';
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  useEffect(() => { initOtel(); }, []);
+  return (
+    <html lang="en">
+      <body className="min-h-screen flex flex-col">
+        <QueryClientProvider client={queryClient}>
+          <Navbar />
+          <main className="flex-1 container mx-auto p-4">{children}</main>
+          <Toast />
+        </QueryClientProvider>
+      </body>
+    </html>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/app/page.tsx
+'use client';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import ProductCard from '@/components/product/ProductCard';
+
+export default function Home() {
+  const { data } = useQuery({
+    queryKey: ['featured'],
+    queryFn: () => api<any[]>('/products?q=featured')
+  });
+
+  return (
+    <section className="grid gap-4 grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+      {data?.map(p => <ProductCard key={p.id} product={p} />)}
+    </section>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/app/cart/page.tsx
+'use client';
+import { useCart } from '@/lib/store';
+import Link from 'next/link';
+
+export default function CartPage() {
+  const { lines, remove } = useCart();
+  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+
+  return (
+    <section>
+      <h1 className="text-2xl mb-4">Your cart</h1>
+      {lines.length === 0 ? <p>Empty.</p> : (
+        <>
+          <table className="w-full text-left">
+            <thead>
+              <tr><th>Name</th><th>Qty</th><th>Price</th><th></th></tr>
+            </thead>
+            <tbody>
+              {lines.map(l => (
+                <tr key={l.id}>
+                  <td>{l.name}</td>
+                  <td>{l.qty}</td>
+                  <td>{(l.price * l.qty).toFixed(2)}</td>
+                  <td><button onClick={() => remove(l.id)}>x</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-4 font-bold">Total: {total.toFixed(2)} $</p>
+          <Link
+            href="/checkout"
+            className="bg-blue-600 text-white px-4 py-2 rounded mt-2 inline-block"
+          >
+            Checkout
+          </Link>
+        </>
+      )}
+    </section>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/app/checkout/page.tsx
+'use client';
+import { useCart } from '@/lib/store';
+import { api } from '@/lib/api';
+import { useRouter } from 'next/navigation';
+
+export default function Checkout() {
+  const router = useRouter();
+  const { lines, clear } = useCart();
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const cartRes = await api<{ id: number }>('/carts', { method: 'POST' });
+    const cartId = cartRes.id;
+    for (const l of lines) {
+      await api(\`/carts/\${cartId}/items\`, {
+        method: 'POST',
+        body: JSON.stringify({ product_id: l.id, quantity: l.qty })
+      });
+    }
+    await api('/orders', {
+      method: 'POST',
+      body: JSON.stringify({ cart_id: cartId, email: e.currentTarget.email.value })
+    });
+    clear();
+    router.push('/thank-you');
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="max-w-md mx-auto space-y-4">
+      <h1 className="text-2xl">Checkout</h1>
+      <input
+        name="email"
+        type="email"
+        required
+        placeholder="Email"
+        className="w-full border p-2"
+      />
+      <button className="w-full bg-green-600 text-white py-2 rounded">Pay now</button>
+    </form>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/app/thank-you/page.tsx
+'use client';
+export default function ThankYou() {
+  return (
+    <section className="text-center py-20">
+      <h1 className="text-3xl font-bold">Thank you for your order!</h1>
+      <p className="mt-4">Your purchase is confirmed. We’ll email you the details shortly.</p>
+    </section>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/components/layout/Navbar.tsx
+'use client';
+import Link from 'next/link';
+import { useCart } from '@/lib/store';
+
+export default function Navbar() {
+  const count = useCart(s => s.lines.reduce((t, l) => t + l.qty, 0));
+  return (
+    <nav className="border-b p-4 flex justify-between">
+      <Link href="/" className="font-bold">OTel-Shop</Link>
+      <Link href="/cart">Cart ({count})</Link>
+    </nav>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/components/product/ProductCard.tsx
+'use client';
+import Image from 'next/image';
+import { useCart } from '@/lib/store';
+import { toast } from 'react-toastify';
+
+export default function ProductCard({ product }: { product: any }) {
+  const add = useCart(s => s.add);
+  return (
+    <div className="border rounded-lg p-2 flex flex-col">
+      <Image
+        src={product.image}
+        alt={product.name}
+        width={300}
+        height={300}
+        className="rounded"
+      />
+      <h3 className="mt-2 font-semibold">{product.name}</h3>
+      <p className="text-sm text-gray-500 flex-1">{product.price.toFixed(2)} $</p>
+      <button
+        onClick={() => { add({ id: product.id, slug: product.slug, name: product.name, price: product.price, qty: 1 }); toast.success('Added to cart'); }}
+        className="mt-2 bg-black text-white py-1 rounded"
+      >
+        Add to cart
+      </button>
+    </div>
+  );
+}
+EOF
+
+cat << 'EOF' > frontend/src/components/ui/Toast.tsx
+'use client';
+import { ToastContainer } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css';
+
+export default function Toast() {
+  return <ToastContainer position="bottom-right" />;
+}
+EOF
+
+echo "📊  Writing Grafana provisioning…"
+cat << 'EOF' > grafana/provisioning/datasources/ds.yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+EOF
+
+cat << 'EOF' > grafana/provisioning/dashboards/otel-dashboard.yaml
+apiVersion: 1
+providers:
+  - name: 'OTel'
+    folder: ''
+    type: file
+    options:
+      path: /etc/grafana/dashboards
+EOF
+
+cat << 'EOF' > grafana/dashboards/otel.json
+{
+  "id": null,
+  "uid": "otel-red",
+  "title": "OTel RED Dashboard",
+  "schemaVersion": 16,
+  "version": 1,
+  "panels": []
+}
+EOF
+
+echo "✅  Setup complete!
+Now run:
+
+  docker compose up --build
+
+Happy tracing! 🚀"
