@@ -23,6 +23,8 @@ services:
       - otel-collector
 
   postgres:
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce"]
     image: postgres:14
     environment:
       POSTGRES_DB: ecommerce
@@ -32,6 +34,11 @@ services:
       - postgres-data:/var/lib/postgresql/data
 
   otel-collector:
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo | nc -w 2 localhost 13133"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     image: otel/opentelemetry-collector-contrib:0.60.0
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
