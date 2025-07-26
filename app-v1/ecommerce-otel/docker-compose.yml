@@ -21,6 +21,9 @@ services:
     depends_on:
       - postgres
       - otel-collector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+   
 
   postgres:
     healthcheck:
