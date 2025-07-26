@@ -1628,3 +1628,5 @@ cat > ecommerce-otel/README.md <<'EOL'
 ## Deployment Instructions:
 ```bash
 docker-compose up --build
+
+EOL
